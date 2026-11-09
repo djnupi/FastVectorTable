@@ -1,6 +1,6 @@
 <?php
 
-namespace MHz\MysqlVector;
+namespace Dj\MysqlVector;
 
 final class VectorExport
 {

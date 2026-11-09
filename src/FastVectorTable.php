@@ -1,6 +1,6 @@
 <?php
 
-namespace MHz\MysqlVector;
+namespace Dj\MysqlVector;
 
 require_once __DIR__ . '/BinaryCodec.php';
 
@@ -77,8 +77,21 @@ class FastVectorTable
 
     public function codec(): BinaryCodec { return $this->codec; }
 
-    /** Create tables and load the stored model (means). Safe to call on every request. */
+    /** One-time setup: create the tables and load the model. In a web app call install() once (a deploy step) and load() per request. */
     public function initialize(): void
+    {
+        $this->install();
+        $this->load();
+    }
+
+    /** Per-request: read the stored model (the means) only. One small query, no DDL. */
+    public function load(): void
+    {
+        $this->loadModel();
+    }
+
+    /** Create the tables if they do not exist. Run once, not on every request. */
+    public function install(): void
     {
         $long = $this->codec->bytes();
         $cols = "code BINARY($long) NOT NULL,";
@@ -99,7 +112,6 @@ class FastVectorTable
             k VARCHAR(32) PRIMARY KEY,
             v MEDIUMTEXT NOT NULL
         ) ENGINE=InnoDB");
-        $this->loadModel();
     }
 
     /**
@@ -116,6 +128,60 @@ class FastVectorTable
         $this->saveModel();
     }
 
+    /**
+     * Rebuild every code from the stored float32 vectors. Use it after losing the model (mean), after changing
+     * seed/bits/rounds/crop (construct the table with the NEW settings first), or to refresh a bad mean.
+     * $refit = true: learn a new mean from a random sample of the stored vectors, then re-encode all rows.
+     * $refit = false: keep the mean currently loaded, only re-encode (settings changed).
+     * Searches during the run see a mix of old and new codes: run it offline. Resumable: not needed, a rerun starts over.
+     * @return int number of rows re-encoded
+     */
+    public function reencodeAll(bool $refit = true, int $sampleSize = 5000, int $batch = 500): int
+    {
+        if ($refit) {
+            $ids = $this->sampleIds($sampleSize);
+            if (!$ids) {
+                return 0;
+            }
+            $sample = [];
+            foreach ($this->fetchVectors($ids) as $v) {
+                $sample[] = array_values($v);
+            }
+            $this->fit($sample, true);
+        }
+        $tiered = $this->shortCodec !== null;
+        $upd = $this->db->prepare('UPDATE `' . $this->table . '` SET code = UNHEX(?)' . ($tiered ? ', code_short = UNHEX(?)' : '') . ' WHERE id = ?');
+        $sel = $this->db->prepare('SELECT id, vec FROM `' . $this->table . '` WHERE id > ? ORDER BY id LIMIT ' . max(1, $batch));
+        $last = 0;
+        $done = 0;
+        while (true) {
+            $sel->bind_param('i', $last);
+            $sel->execute();
+            $rows = $sel->get_result()->fetch_all(MYSQLI_NUM);
+            if (!$rows) {
+                break;
+            }
+            $this->db->begin_transaction();
+            foreach ($rows as [$id, $blob]) {
+                [$long, $short] = $this->codesFor(array_values(unpack('g*', $blob)));
+                $lh = bin2hex($long);
+                if ($tiered) {
+                    $sh = bin2hex($short);
+                    $upd->bind_param('ssi', $lh, $sh, $id);
+                } else {
+                    $upd->bind_param('si', $lh, $id);
+                }
+                $upd->execute();
+                $last = (int)$id;
+                $done++;
+            }
+            $this->db->commit();
+        }
+        $upd->close();
+        $sel->close();
+        return $done;
+    }
+
     /** @return array [longCode, shortCode|null] for a FULL vector */
     protected function codesFor(array $v): array
     {
@@ -127,9 +193,10 @@ class FastVectorTable
 
     /**
      * @param array $items list of ['fk' => int|null, 'text' => string, 'vector' => float[]]
+     * @param int $batchSize rows per INSERT statement (multi-row inserts are much faster than one statement per row)
      * @return int[] inserted ids
      */
-    public function insertMany(array $items): array
+    public function insertMany(array $items, int $batchSize = 200): array
     {
         $rows = [];
         foreach ($items as $it) {
@@ -137,7 +204,7 @@ class FastVectorTable
             [$long, $short] = $this->codesFor($v);
             $rows[] = ['fk' => $it['fk'] ?? null, 'text' => (string)$it['text'], 'vec' => pack('g*', ...$v), 'code' => $long, 'short' => $short];
         }
-        return $this->storeRows($rows);
+        return $this->storeRows($rows, $batchSize);
     }
 
     /**
@@ -152,11 +219,11 @@ class FastVectorTable
         $q = BinaryCodec::normalize($vector);
         [$long, $short] = $this->codesFor($q);
         $useShort = $short !== null && ($twoStage ?? ($nShort !== null || $this->estimatedRows() >= $this->twoStageMinRows));
-        $ids = $this->candidateIds(bin2hex($long), max($n, $nPre), $useShort ? bin2hex($short) : null, $nShort ?? 10 * max($n, $nPre));
-        if (!$ids) {
+        $vecs = $this->candidateVectors(bin2hex($long), max($n, $nPre), $useShort ? bin2hex($short) : null, $nShort ?? 10 * max($n, $nPre));
+        if (!$vecs) {
             return [];
         }
-        $top = self::rerank($q, $this->fetchVectors($ids), $n);
+        $top = self::rerank($q, $vecs, $n);
         $rows = $this->fetchRows(array_column($top, 0));
         $out = [];
         foreach ($top as [$id, $sim]) {
@@ -315,20 +382,53 @@ class FastVectorTable
         }
     }
 
-    /** Row count estimate for the mode switch (InnoDB estimate; may lag, which is fine for a threshold). Cached 60 s. */
+    /**
+     * Row count estimate for the mode switch (InnoDB estimate; may lag, which is fine for a threshold).
+     * Cached per process (60 s) and, when APCu is enabled, across requests (300 s), so a web request normally
+     * costs no extra query. Without APCu in PHP-FPM every request asks the server once.
+     */
     protected function estimatedRows(): int
     {
         if ($this->rowsCache !== null && microtime(true) - $this->rowsCacheAt < 60) {
             return $this->rowsCache;
         }
-        $r = $this->db->query("SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{$this->table}'");
-        $row = $r ? $r->fetch_row() : null;
-        $n = $row ? (int)$row[0] : 0;
-        if ($n === 0) {
-            $n = $this->count();   // fresh table: statistics not populated yet
+        $key = $this->cacheKey();
+        $n = $this->cacheGet($key);
+        if ($n === null) {
+            $n = $this->queryRowEstimate();
+            $this->cacheSet($key, $n, 300);
         }
         $this->rowsCacheAt = microtime(true);
         return $this->rowsCache = $n;
+    }
+
+    protected function queryRowEstimate(): int
+    {
+        $r = $this->db->query("SELECT TABLE_ROWS FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = '{$this->table}'");
+        $row = $r ? $r->fetch_row() : null;
+        $n = $row ? (int)$row[0] : 0;
+        return $n > 0 ? $n : $this->count();   // fresh table: statistics not populated yet
+    }
+
+    protected function cacheKey(): string
+    {
+        return 'mhz_fast_rows:' . $this->table . ':' . crc32((string)$this->db->host_info);
+    }
+
+    protected function cacheGet(string $key): ?int
+    {
+        if (function_exists('apcu_enabled') && apcu_enabled()) {
+            $v = apcu_fetch($key, $ok);
+            return $ok ? (int)$v : null;
+        }
+        return null;
+    }
+
+    protected function cacheSet(string $key, int $value, int $ttl): void
+    {
+        if (function_exists('apcu_enabled') && apcu_enabled()) {
+            apcu_store($key, $value, $ttl);
+        }
     }
 
     public function count(): int
@@ -376,65 +476,115 @@ class FastVectorTable
         $st->close();
     }
 
-    /** @return int[] */
-    protected function storeRows(array $rows): array
+    /** Multi-row INSERT with $rows value tuples. */
+    protected function insertSql(int $rows): string
     {
         $tiered = $this->shortCodec !== null;
-        $st = $this->db->prepare($tiered
-            ? "INSERT INTO `{$this->table}` (fk, text, vec, code, code_short) VALUES (?, ?, ?, UNHEX(?), UNHEX(?))"
-            : "INSERT INTO `{$this->table}` (fk, text, vec, code) VALUES (?, ?, ?, UNHEX(?))");
-        if (!$st) {
-            throw new \RuntimeException($this->db->error);
-        }
+        $tuple = $tiered ? '(?, ?, ?, UNHEX(?), UNHEX(?))' : '(?, ?, ?, UNHEX(?))';
+        $cols = $tiered ? 'fk, text, vec, code, code_short' : 'fk, text, vec, code';
+        return "INSERT INTO `{$this->table}` ($cols) VALUES " . implode(', ', array_fill(0, $rows, $tuple));
+    }
+
+    /** @return int[] ids, assuming consecutive auto-increment values within one statement (step = auto_increment_increment) */
+    protected function storeRows(array $rows, int $batch = 200): array
+    {
+        $tiered = $this->shortCodec !== null;
+        $rowTypes = $tiered ? 'issss' : 'isss';
+        $step = $this->autoIncrementStep();
         $ids = [];
+        $stmts = [];
         $this->db->begin_transaction();
         try {
-            foreach ($rows as $r) {
-                $fk = $r['fk'];
-                $text = $r['text'];
-                $vec = $r['vec'];
-                $hex = bin2hex($r['code']);
-                if ($tiered) {
-                    $hexShort = bin2hex($r['short']);
-                    $st->bind_param('issss', $fk, $text, $vec, $hex, $hexShort);
-                } else {
-                    $st->bind_param('isss', $fk, $text, $vec, $hex);
+            foreach (array_chunk($rows, max(1, $batch)) as $chunk) {
+                $c = count($chunk);
+                $st = $stmts[$c] ??= $this->db->prepare($this->insertSql($c));
+                if (!$st) {
+                    throw new \RuntimeException($this->db->error);
                 }
+                $params = [];
+                foreach ($chunk as $r) {
+                    array_push($params, $r['fk'], $r['text'], $r['vec'], bin2hex($r['code']));
+                    if ($tiered) {
+                        $params[] = bin2hex($r['short']);
+                    }
+                }
+                $st->bind_param(str_repeat($rowTypes, $c), ...$params);
                 if (!$st->execute()) {
                     throw new \RuntimeException($st->error);
                 }
-                $ids[] = $st->insert_id;
+                for ($k = 0; $k < $c; $k++) {
+                    $ids[] = $st->insert_id + $k * $step;
+                }
             }
             $this->db->commit();
         } catch (\Throwable $e) {
             $this->db->rollback();
             throw $e;
         } finally {
-            $st->close();
+            foreach ($stmts as $st) {
+                if ($st) {
+                    $st->close();
+                }
+            }
         }
         return $ids;
     }
 
+    private ?int $autoStep = null;
+
+    protected function autoIncrementStep(): int
+    {
+        if ($this->autoStep === null) {
+            $r = $this->db->query('SELECT @@auto_increment_increment');
+            $this->autoStep = $r ? max(1, (int)$r->fetch_row()[0]) : 1;
+        }
+        return $this->autoStep;
+    }
+
     /**
-     * Stage 1. @return int[] ids with the smallest Hamming distance to the query code.
+     * The SELECT id ... statement of stage 1 (1 or 2 `?` placeholders: the short code first, then the long code).
      * Two-stage: the inner query selects ONLY id, so it can be answered from the covering index idx_short; it keeps
      * $limitShort ids. The outer query joins back to read the long code of just those rows and ranks them.
      * A derived table is used because MySQL does not allow LIMIT inside IN (subquery).
      * FORCE INDEX makes the scans read the narrow index instead of the wide table rows.
      */
-    protected function candidateIds(string $hexCode, int $limit, ?string $hexShort = null, int $limitShort = 0): array
+    protected function candidateSql(bool $twoStage, int $limit, int $limitShort): string
     {
-        if ($hexShort === null) {
-            $st = $this->db->prepare("SELECT id FROM `{$this->table}` FORCE INDEX (idx_code) ORDER BY BIT_COUNT(code ^ UNHEX(?)) LIMIT " . (int)$limit);
-            $st?->bind_param('s', $hexCode);
-        } else {
-            $st = $this->db->prepare("SELECT s.id FROM (SELECT id FROM `{$this->table}` FORCE INDEX (idx_short) ORDER BY BIT_COUNT(code_short ^ UNHEX(?)) LIMIT "
-                . (int)max($limit, $limitShort) . ") s JOIN `{$this->table}` t ON t.id = s.id ORDER BY BIT_COUNT(t.code ^ UNHEX(?)) LIMIT " . (int)$limit);
-            $st?->bind_param('ss', $hexShort, $hexCode);
+        $t = "`{$this->table}`";
+        if (!$twoStage) {
+            return "SELECT id FROM $t FORCE INDEX (idx_code) ORDER BY BIT_COUNT(code ^ UNHEX(?)) LIMIT " . (int)$limit;
         }
+        return "SELECT s.id FROM (SELECT id FROM $t FORCE INDEX (idx_short) ORDER BY BIT_COUNT(code_short ^ UNHEX(?)) LIMIT "
+            . (int)max($limit, $limitShort) . ") s JOIN $t t ON t.id = s.id ORDER BY BIT_COUNT(t.code ^ UNHEX(?)) LIMIT " . (int)$limit;
+    }
+
+    /** Stage 1 in one statement, vectors included: ids from candidateSql(), joined back for their `vec`. @return array id => unpack('g*') array */
+    protected function candidateVectors(string $hexCode, int $limit, ?string $hexShort = null, int $limitShort = 0): array
+    {
+        $sql = "SELECT v.id, v.vec FROM (" . $this->candidateSql($hexShort !== null, $limit, $limitShort) . ") c JOIN `{$this->table}` v ON v.id = c.id";
+        $st = $this->db->prepare($sql);
         if (!$st) {
             throw new \RuntimeException($this->db->error);
         }
+        $hexShort === null ? $st->bind_param('s', $hexCode) : $st->bind_param('ss', $hexShort, $hexCode);
+        $st->execute();
+        $res = $st->get_result();
+        $out = [];
+        while ($row = $res->fetch_row()) {
+            $out[(int)$row[0]] = unpack('g*', $row[1]);
+        }
+        $st->close();
+        return $out;
+    }
+
+    /** Stage 1, ids only. @return int[] ids with the smallest Hamming distance to the query code. */
+    protected function candidateIds(string $hexCode, int $limit, ?string $hexShort = null, int $limitShort = 0): array
+    {
+        $st = $this->db->prepare($this->candidateSql($hexShort !== null, $limit, $limitShort));
+        if (!$st) {
+            throw new \RuntimeException($this->db->error);
+        }
+        $hexShort === null ? $st->bind_param('s', $hexCode) : $st->bind_param('ss', $hexShort, $hexCode);
         $st->execute();
         $st->bind_result($id);
         $ids = [];

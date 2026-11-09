@@ -1,6 +1,6 @@
 <?php
 
-namespace MHz\MysqlVector;
+namespace Dj\MysqlVector;
 
 /**
  * Turns a float vector into a binary code that can be compared with XOR/BIT_COUNT in MySQL.

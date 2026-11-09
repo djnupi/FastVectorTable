@@ -1,6 +1,6 @@
 <?php
 
-namespace MHz\MysqlVector;
+namespace Dj\MysqlVector;
 
 require_once __DIR__ . '/FastVectorTable.php';
 
@@ -15,7 +15,7 @@ final class InMemoryVectorTable extends FastVectorTable {
     protected function estimatedRows(): int { return count($this->rows); }
     public function count(): int { return count($this->rows); }
     protected function saveModel(): void {}
-    protected function storeRows(array $rows): array { $ids = []; foreach ($rows as $r) { $this->rows[] = $r; $ids[] = count($this->rows); } return $ids; }
+    protected function storeRows(array $rows, int $batch = 200): array { $ids = []; foreach ($rows as $r) { $this->rows[] = $r; $ids[] = count($this->rows); } return $ids; }
     protected function candidateIds(string $hex, int $limit, ?string $hexShort = null, int $limitShort = 0): array {
         $q = hex2bin($hex); $d = []; $rows = $this->rows; $this->lastUsedShort = $hexShort !== null;
         if ($hexShort !== null) {                       // tier 1: short code over all rows, keep $limitShort
@@ -26,6 +26,7 @@ final class InMemoryVectorTable extends FastVectorTable {
         foreach ($rows as $i => $r) $d[$i + 1] = BinaryCodec::hamming($q, $r['code']);
         asort($d); return array_slice(array_keys($d), 0, $limit);
     }
+    protected function candidateVectors(string $hex, int $limit, ?string $hexShort = null, int $limitShort = 0): array { return $this->fetchVectors($this->candidateIds($hex, $limit, $hexShort, $limitShort)); }
     protected function fetchVectors(array $ids): array { $o = []; foreach ($ids as $id) $o[$id] = unpack('g*', $this->rows[$id - 1]['vec']); return $o; }
     protected function fetchRows(array $ids): array { $o = []; foreach ($ids as $id) $o[$id] = ['fk' => $this->rows[$id - 1]['fk'], 'text' => $this->rows[$id - 1]['text']]; return $o; }
     protected function eachVector(): \Generator { foreach ($this->rows as $i => $r) yield $i + 1 => $r['vec']; }

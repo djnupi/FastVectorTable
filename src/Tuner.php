@@ -1,6 +1,6 @@
 <?php
 
-namespace MHz\MysqlVector;
+namespace Dj\MysqlVector;
 
 require_once __DIR__ . '/InMemoryVectorTable.php';
 
