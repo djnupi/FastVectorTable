@@ -1,2 +1,2 @@
 # fast-mysql-vector
-a php class for fast and accurate vector search
+a php class for fast and accurate vector search in mysql
