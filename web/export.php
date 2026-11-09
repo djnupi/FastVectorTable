@@ -1,7 +1,7 @@
 <?php
 // Browser version of tools/export.php. Writes a float32 sample file (config 'out'); add ?download=1 to download it instead.
 require __DIR__ . '/_bootstrap.php';
-use MHz\MysqlVector\VectorExport;
+use Dj\MysqlVector\VectorExport;
 
 $rows = max(10, min(50000, (int)$cfg['rows']));
 streamStart();

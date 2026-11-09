@@ -1,8 +1,8 @@
 <?php
 // Browser version of tools/tune.php. Reads a sample from the table (default) or from the exported file and prints the grid.
 require __DIR__ . '/_bootstrap.php';
-use MHz\MysqlVector\Tuner;
-use MHz\MysqlVector\VectorExport;
+use Dj\MysqlVector\Tuner;
+use Dj\MysqlVector\VectorExport;
 
 $rows = max(100, min(5000, (int)$cfg['rows']));
 streamStart();
