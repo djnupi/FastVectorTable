@@ -2,7 +2,7 @@
 
 a php class for fast and accurate vector search in mysql
 
-Same idea as the article (binary pre-ranking in MySQL, exact cosine afterwards), with four changes.
+Same idea as [the article]((https://medium.com/@dj.luiting/fast-and-accurate-vector-similarity-search-in-native-mysql-there-are-many-existing-specialized-0646ded2a565?source=user_profile_page---------0-------------3db646c36776------------------------))  (binary pre-ranking in MySQL, exact cosine afterwards), with four changes, the starting pont was .
 
 | # | Change | Why |
 |---|--------|-----|
