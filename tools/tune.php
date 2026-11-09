@@ -5,8 +5,8 @@
  */
 require __DIR__ . '/../src/Tuner.php';
 require __DIR__ . '/../src/VectorExport.php';
-use MHz\MysqlVector\Tuner;
-use MHz\MysqlVector\VectorExport;
+use Dj\MysqlVector\Tuner;
+use Dj\MysqlVector\VectorExport;
 
 $file = $argv[1] ?? null; $dims = (int)($argv[2] ?? 0);
 if (!$file || !$dims) { fwrite(STDERR, "usage: php tools/tune.php vectors.f32 DIMS [rows] [queries] [targetRecall]\n"); exit(1); }
