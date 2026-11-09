@@ -1,7 +1,7 @@
 <?php
 // php tests/export_test.php -- tests the crop/normalize/pack step of tools/export.php (the SQL part needs a server)
 require __DIR__ . '/../src/VectorExport.php';
-use MHz\MysqlVector\VectorExport;
+use Dj\MysqlVector\VectorExport;
 mt_srand(3); $ok = true;
 $v768 = []; for ($i = 0; $i < 768; $i++) $v768[] = mt_rand() / mt_getrandmax() - 0.5;
 $blob = VectorExport::toF32($v768, 384);

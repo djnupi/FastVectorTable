@@ -1,9 +1,9 @@
 <?php
 // php tests/selftest.php   -- needs no MySQL server. Tests the PHP logic; the SQL strings are NOT exercised here.
 require __DIR__ . '/../src/InMemoryVectorTable.php';
-use MHz\MysqlVector\BinaryCodec;
-use MHz\MysqlVector\FastVectorTable;
-use MHz\MysqlVector\InMemoryVectorTable;
+use Dj\MysqlVector\BinaryCodec;
+use Dj\MysqlVector\FastVectorTable;
+use Dj\MysqlVector\InMemoryVectorTable;
 
 $fail = 0;
 function check(string $name, bool $ok, string $info = ''): void { global $fail; echo ($ok ? "PASS" : "FAIL") . "  $name $info\n"; if (!$ok) $fail++; }
@@ -88,5 +88,29 @@ foreach ([['single tier, crop 256, 512 bits', $one, null], ['two tier, nShort=50
     $e = $tbl->evaluate(30, [100], 10, $ns);
     printf("  %-34s recall@10 (100 candidates) = %.3f\n", $label, $e[100]['recall']);
 }
+
+// 5. request overhead: install() once, load() per request; cached row estimate; multi-row insert and stage-1 SQL text
+final class SpyTable extends FastVectorTable {
+    public array $sql = []; public static int $rowQueries = 0; public static array $cache = [];
+    public function __construct() { parent::__construct(mysqli_init(), 'spy', 384, 1024, 2, '7', null, 128, 128, 1000); }
+    protected function exec(string $sql): void { $this->sql[] = 'DDL'; }
+    protected function loadModel(): void { $this->sql[] = 'LOAD'; }
+    protected function queryRowEstimate(): int { self::$rowQueries++; return 5000; }
+    protected function cacheKey(): string { return 'k'; }
+    protected function cacheGet(string $k): ?int { return self::$cache[$k] ?? null; }
+    protected function cacheSet(string $k, int $v, int $ttl): void { self::$cache[$k] = $v; }
+    public function rows(): int { return $this->estimatedRows(); }
+    public function ins(int $n): string { return $this->insertSql($n); }
+    public function cand(bool $two, int $l, int $ls): string { return $this->candidateSql($two, $l, $ls); }
+}
+$sp = new SpyTable(); $sp->install(); $afterInstall = $sp->sql; $sp->sql = []; $sp->load();
+check('install() runs the 2 CREATE TABLEs; load() runs no DDL, only the model read', $afterInstall === ['DDL', 'DDL'] && $sp->sql === ['LOAD'], json_encode([$afterInstall, $sp->sql]));
+$a = (new SpyTable())->rows(); $b = (new SpyTable())->rows();
+check('row estimate is queried once and then served from the cross-request cache', $a === 5000 && $b === 5000 && SpyTable::$rowQueries === 1, 'queries=' . SpyTable::$rowQueries);
+check('multi-row INSERT has one tuple per row, 5 columns per tuple when tiered', $sp->ins(3) === 'INSERT INTO `spy_fast` (fk, text, vec, code, code_short) VALUES (?, ?, ?, UNHEX(?), UNHEX(?)), (?, ?, ?, UNHEX(?), UNHEX(?)), (?, ?, ?, UNHEX(?), UNHEX(?))');
+$one = $sp->cand(false, 200, 0); $two = $sp->cand(true, 200, 2000);
+check('direct stage-1 SQL: covering index, one placeholder', str_contains($one, 'FORCE INDEX (idx_code)') && substr_count($one, '?') === 1 && str_ends_with($one, 'LIMIT 200'), $one);
+check('two-stage SQL: id-only inner query on idx_short, join back, two placeholders', str_contains($two, 'SELECT id FROM `spy_fast` FORCE INDEX (idx_short)') && str_contains($two, 'LIMIT 2000) s JOIN') && substr_count($two, '?') === 2 && str_ends_with($two, 'LIMIT 200'), $two);
+
 echo $fail ? "\n$fail FAILED\n" : "\nall passed\n";
 exit($fail ? 1 : 0);
